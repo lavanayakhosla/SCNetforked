@@ -2,114 +2,145 @@ import torch
 import torch.nn as nn
 from torch.nn.modules.rnn import LSTM
 
-class FeatureConversion(nn.Module):
-    """
-    Integrates into the adjacent Dual-Path layer. 
 
-    Args:
-        channels (int): Number of input channels.
-        inverse (bool): If True, uses ifft; otherwise, uses rfft.
-    """    
-    def __init__(self, channels, inverse):
+class CumulativeLayerNorm(nn.Module):
+    """
+    Cumulative Layer Normalization (cLN) for causal/real-time processing.
+    At each time step t, normalization statistics are computed using only
+    frames 0..t (no future information).
+    
+    Supports 3D input (B, C, T) and 4D input (B, C, F, T).
+    """
+    def __init__(self, num_channels, eps=1e-8):
         super().__init__()
-        self.inverse = inverse
-        self.channels= channels
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(num_channels))
+        self.bias = nn.Parameter(torch.zeros(num_channels))
 
     def forward(self, x):
-        # B, C, F, T = x.shape
-        if self.inverse:
-            x = x.float()
-            x_r = x[:, :self.channels//2, :, :]
-            x_i = x[:, self.channels//2:, :, :]
-            x = torch.complex(x_r, x_i)
-            x = torch.fft.irfft(x, dim=3, norm="ortho")
+        if x.dim() == 3:
+            return self._forward_3d(x)
+        elif x.dim() == 4:
+            return self._forward_4d(x)
         else:
-            x = x.float()
-            x = torch.fft.rfft(x, dim=3, norm="ortho")
-            x_real = x.real
-            x_imag = x.imag
-            x = torch.cat([x_real, x_imag], dim=1)
+            raise ValueError(f"CumulativeLayerNorm expects 3D or 4D input, got {x.dim()}D")
+
+    def _forward_3d(self, x):
+        # x: (B, C, T)
+        B, C, T = x.shape
+        step = torch.arange(1, T + 1, device=x.device, dtype=x.dtype).view(1, 1, T)
+        
+        # Cumulative sum along time
+        cum_sum = torch.cumsum(x, dim=-1)        # (B, C, T)
+        cum_sum_sq = torch.cumsum(x.pow(2), dim=-1)  # (B, C, T)
+        
+        # Mean and variance over C, cumulative over T
+        count = step * C  # (1, 1, T)
+        cum_mean = cum_sum.sum(dim=1, keepdim=True) / count    # (B, 1, T)
+        cum_var = cum_sum_sq.sum(dim=1, keepdim=True) / count - cum_mean.pow(2)
+        cum_var = torch.clamp(cum_var, min=0)
+        
+        x = (x - cum_mean) / (cum_var + self.eps).sqrt()
+        x = x * self.weight.view(1, C, 1) + self.bias.view(1, C, 1)
+        return x
+
+    def _forward_4d(self, x):
+        # x: (B, C, F, T)
+        B, C, F, T = x.shape
+        step = torch.arange(1, T + 1, device=x.device, dtype=x.dtype).view(1, 1, 1, T)
+        
+        # Cumulative sum along time
+        cum_sum = torch.cumsum(x, dim=-1)        # (B, C, F, T)
+        cum_sum_sq = torch.cumsum(x.pow(2), dim=-1)  # (B, C, F, T)
+        
+        # Mean and variance over C and F, cumulative over T
+        count = step * C * F  # (1, 1, 1, T)
+        cum_mean = cum_sum.sum(dim=(1, 2), keepdim=True) / count    # (B, 1, 1, T)
+        cum_var = cum_sum_sq.sum(dim=(1, 2), keepdim=True) / count - cum_mean.pow(2)
+        cum_var = torch.clamp(cum_var, min=0)
+        
+        x = (x - cum_mean) / (cum_var + self.eps).sqrt()
+        x = x * self.weight.view(1, C, 1, 1) + self.bias.view(1, C, 1, 1)
         return x
 
 
 class DualPathRNN(nn.Module):
     """  
-    Dual-Path RNN in Separation Network.
+    Causal Dual-Path RNN for Online SCNet.
+    
+    - Frequency-path: Bidirectional LSTM (full frequency band is available).
+    - Time-path: Unidirectional LSTM (causal — no future frames).
+    - Uses Cumulative Layer Normalization (cLN) instead of GroupNorm.
 
     Args:
-        d_model (int): The number of expected features in the input (input_size).
-        expand (int): Expansion factor used to calculate the hidden_size of LSTM.
-        bidirectional (bool): If True, becomes a bidirectional LSTM.
+        d_model (int): The number of expected features in the input.
+        expand (int): Expansion factor for LSTM hidden size.
     """
-    def __init__(self, d_model, expand, bidirectional=True):
+    def __init__(self, d_model, expand):
         super(DualPathRNN, self).__init__()
 
         self.d_model = d_model
         self.hidden_size = d_model * expand
-        self.bidirectional = bidirectional
-        # Initialize LSTM layers and normalization layers
-        self.lstm_layers = nn.ModuleList([self._init_lstm_layer(self.d_model, self.hidden_size) for _ in range(2)])
-        self.linear_layers = nn.ModuleList([nn.Linear(self.hidden_size*2, self.d_model) for _ in range(2)])
-        self.norm_layers = nn.ModuleList([nn.GroupNorm(1, d_model) for _ in range(2)])
 
-    def _init_lstm_layer(self, d_model, hidden_size):
-        return LSTM(d_model, hidden_size, num_layers=1, bidirectional=self.bidirectional, batch_first=True)
+        # Frequency-path: bidirectional (full frequency info is available)
+        self.lstm_freq = LSTM(d_model, self.hidden_size, num_layers=1,
+                              bidirectional=True, batch_first=True)
+        self.linear_freq = nn.Linear(self.hidden_size * 2, d_model)
+        self.norm_freq = CumulativeLayerNorm(d_model)
+
+        # Time-path: unidirectional (causal — no future information)
+        self.lstm_time = LSTM(d_model, self.hidden_size, num_layers=1,
+                              bidirectional=False, batch_first=True)
+        self.linear_time = nn.Linear(self.hidden_size, d_model)
+        self.norm_time = CumulativeLayerNorm(d_model)
 
     def forward(self, x):
         B, C, F, T = x.shape
-        
-        # Process dual-path rnn
-        original_x = x
+
         # Frequency-path
-        x = self.norm_layers[0](x)
-        x = x.transpose(1, 3).contiguous().view(B * T, F, C)  
-        x, _ = self.lstm_layers[0](x)
-        x = self.linear_layers[0](x)
+        original_x = x
+        x = self.norm_freq(x)
+        x = x.transpose(1, 3).contiguous().view(B * T, F, C)
+        x, _ = self.lstm_freq(x)
+        x = self.linear_freq(x)
         x = x.view(B, T, F, C).transpose(1, 3)
         x = x + original_x
 
+        # Time-path (causal)
         original_x = x
-        # Time-path
-        x = self.norm_layers[1](x)
+        x = self.norm_time(x)
         x = x.transpose(1, 2).contiguous().view(B * F, C, T).transpose(1, 2)
-        x, _ = self.lstm_layers[1](x)
-        x = self.linear_layers[1](x)
+        x, _ = self.lstm_time(x)
+        x = self.linear_time(x)
         x = x.transpose(1, 2).contiguous().view(B, F, C, T).transpose(1, 2)
         x = x + original_x
 
         return x
-    
-
-
 
 
 class SeparationNet(nn.Module):
     """
-    Implements a simplified Sparse Down-sample block in an encoder architecture.
+    Causal Separation Network for Online SCNet.
+    
+    - All DPRNN layers use the same channel dimension (no FFT doubling).
+    - FeatureConversion (FFT/iFFT) between layers is REMOVED for real-time operation.
     
     Args:
-    - channels (int): Number input channels.
-    - expand (int): Expansion factor used to calculate the hidden_size of LSTM.
+    - channels (int): Number of input channels.
+    - expand (int): Expansion factor for LSTM hidden size.
     - num_layers (int): Number of dual-path layers.
     """
     def __init__(self, channels, expand=1, num_layers=6):
         super(SeparationNet, self).__init__()
-        
+
         self.num_layers = num_layers
 
+        # All layers use same channels (no FFT-based channel doubling)
         self.dp_modules = nn.ModuleList([
-                DualPathRNN(channels * (2 if i % 2 == 1 else 1), expand) for i in range(num_layers)
+            DualPathRNN(channels, expand) for _ in range(num_layers)
         ])
-        
-        self.feature_conversion = nn.ModuleList([
-            FeatureConversion(channels * 2 , inverse = False if i % 2 == 0 else True) for i in range(num_layers)
-        ])
+
     def forward(self, x):
-        for i in range(self.num_layers):
-           x = self.dp_modules[i](x)
-           x = self.feature_conversion[i](x)
+        for dp in self.dp_modules:
+            x = dp(x)
         return x
-
-
-
-

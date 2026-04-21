@@ -6,10 +6,6 @@ from torch.nn import functional as F
 import tqdm
 
 from .utils import center_trim, DummyPoolExecutor
-from accelerate import Accelerator
-
-accelerator = Accelerator()
-
 
 
 class TensorChunk:
@@ -81,7 +77,9 @@ def apply_model(model, mix, shifts=1, split=True, segment=20, samplerate=44100,
             When `device` is different from `mix.device`, only local computations will
             be on `device`, while the entire tracks will be stored on `mix.device`.
     """
-    device = accelerator.device
+    if device is None:
+        device = next(model.parameters()).device
+
     if pool is None:
         if num_workers > 0 and device.type == 'cpu':
             pool = ThreadPoolExecutor(num_workers)
@@ -96,21 +94,26 @@ def apply_model(model, mix, shifts=1, split=True, segment=20, samplerate=44100,
         'device': device,
         'pool': pool,
     }
-    model = accelerator.unwrap_model(model)
-    model.to(device)
+
+    # Unwrap DataParallel if needed
+    if isinstance(model, th.nn.DataParallel):
+        model_unwrapped = model.module
+    else:
+        model_unwrapped = model
+    model_unwrapped.to(device)
 
     assert transition_power >= 1, "transition_power < 1 leads to weird behavior."
     batch, channels, length = mix.shape
     if split:
         kwargs['split'] = False
-        out = th.zeros(batch, len(model.sources), channels, length, device=mix.device)
+        out = th.zeros(batch, len(model_unwrapped.sources), channels, length, device=mix.device)
         sum_weight = th.zeros(length, device=mix.device)
         segment = int(samplerate * segment)
         stride = int((1 - overlap) * segment)
         offsets = range(0, length, stride)
         scale = stride / samplerate
         weight = th.cat([th.arange(1, segment // 2 + 1, device=device),
-                         th.arange(segment - segment // 2, 0, -1, device=device)])              
+                         th.arange(segment - segment // 2, 0, -1, device=device)])
         assert len(weight) == segment
         # If the overlap < 50%, this will translate to linear transition when
         # transition_power is 1.

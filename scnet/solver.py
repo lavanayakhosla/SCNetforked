@@ -7,11 +7,11 @@ from . import augment
 from .loss import spec_rmse_loss
 from tqdm import tqdm
 from .log import logger
-from accelerate import Accelerator
-from torch.cuda.amp import GradScaler, autocast
+
 
 def _summary(metrics):
     return " | ".join(f"{key.capitalize()}={val}" for key, val in metrics.items())
+
 
 class Solver(object):
     def __init__(self, loaders, model, optimizer, config, args):
@@ -21,16 +21,22 @@ class Solver(object):
         self.model = model
         self.optimizer = optimizer
         self.device = next(iter(self.model.parameters())).device
-        self.accelerator = Accelerator()
-        self.scaler = GradScaler()
+
+        # Mixed precision scaler (modern API)
+        self.scaler = torch.amp.GradScaler('cuda') if self.device.type == 'cuda' else None
 
         self.stft_config = {
             'n_fft': config.model.nfft,
             'hop_length': config.model.hop_size,
             'win_length': config.model.win_size,
             'center': True,
-            'normalized': config.model.normalized
+            'normalized': config.model.normalized,
+            'window': torch.hann_window(config.model.win_size).to(self.device)
         }
+
+        # Gradient clipping max norm
+        self.max_grad_norm = 5.0
+
         # Exponential moving average of the model
         self.emas = {'batch': [], 'epoch': []}
         for kind in self.emas.keys():
@@ -69,17 +75,17 @@ class Solver(object):
         for kind, emas in self.emas.items():
             for k, ema in enumerate(emas):
                 package[f'ema_{kind}_{k}'] = ema.state_dict()
-        if steps: 
+        if steps:
             checkpoint_with_steps = Path(self.checkpoint_file).with_name(f'checkpoint_{epoch+1}_{steps}.th')
-            self.accelerator.save(package, checkpoint_with_steps)
+            torch.save(package, checkpoint_with_steps)
         else:
-            self.accelerator.save(package, self.checkpoint_file)
+            torch.save(package, self.checkpoint_file)
 
     def _reset(self):
         """Reset state of the solver, potentially using checkpoint."""
         if self.checkpoint_file.exists():
             logger.info(f'Loading checkpoint model: {self.checkpoint_file}')
-            package = torch.load(self.checkpoint_file, map_location=self.accelerator.device)
+            package = torch.load(self.checkpoint_file, map_location=self.device)
             self.model.load_state_dict(package['state'])
             self.best_nsdr = package['best_nsdr']
             self.best_state = package['best_state']
@@ -119,10 +125,10 @@ class Solver(object):
     def train(self):
         # Optimizing the model
         for epoch in range(self.epoch + 1, self.config.epochs):
-            #Adjust learning rate
+            # Adjust learning rate
             for param_group in self.optimizer.param_groups:
-              param_group['lr'] = self.config.optim.lr * (self.config.optim.decay_rate**((epoch)//self.config.optim.decay_step))
-              logger.info(f"Learning rate adjusted to {self.optimizer.param_groups[0]['lr']}")
+                param_group['lr'] = self.config.optim.lr * (self.config.optim.decay_rate ** ((epoch) // self.config.optim.decay_step))
+                logger.info(f"Learning rate adjusted to {self.optimizer.param_groups[0]['lr']}")
 
             # Train one epoch
             self.model.train()
@@ -130,17 +136,15 @@ class Solver(object):
             logger.info('-' * 70)
             logger.info(f'Training Epoch {epoch + 1} ...')
 
-
             metrics['train'] = self._run_one_epoch(epoch)
             formatted = self._format_train(metrics['train'])
             logger.info(
                 f'Train Summary | Epoch {epoch + 1} | {_summary(formatted)}')
 
-
             # Cross validation
             logger.info('-' * 70)
             logger.info('Cross validation...')
-            self.model.eval()  # Turn off Batchnorm & Dropout
+            self.model.eval()
             with torch.no_grad():
                 valid = self._run_one_epoch(epoch, train=False)
                 bvalid = valid
@@ -163,40 +167,33 @@ class Solver(object):
                     metrics['valid'].update(bvalid)
                     metrics['valid']['bname'] = bname
 
-
-
             formatted = self._format_train(metrics['valid'])
             logger.info(
                 f'Valid Summary | Epoch {epoch + 1} | {_summary(formatted)}')
-            
+
             valid_nsdr = metrics['valid']['nsdr']
             # Save the best model
             if valid_nsdr > self.best_nsdr:
-              logger.info('New best valid nsdr %.4f', valid_nsdr)
-              self.best_state = copy_state(state)
-              self.best_nsdr = valid_nsdr
+                logger.info('New best valid nsdr %.4f', valid_nsdr)
+                self.best_state = copy_state(state)
+                self.best_nsdr = valid_nsdr
 
-            if self.accelerator.is_main_process:
-                self._serialize(epoch)
+            self._serialize(epoch)
             if epoch == self.config.epochs - 1:
                 break
-
 
     def _run_one_epoch(self, epoch, train=True):
         config = self.config
         data_loader = self.loaders['train'] if train else self.loaders['valid']
-        data_loader.sampler.epoch = epoch
 
         label = ["Valid", "Train"][train]
         name = label + f" | Epoch {epoch + 1}"
         total = len(data_loader)
 
         averager = EMA()
+        data_loader_iter = tqdm(data_loader) if train else data_loader
 
-        if self.accelerator.is_main_process:
-            data_loader = tqdm(data_loader)
-
-        for idx, sources in enumerate(data_loader):
+        for idx, sources in enumerate(data_loader_iter):
             sources = sources.to(self.device)
             if train:
                 sources = self.augment(sources)
@@ -205,11 +202,20 @@ class Solver(object):
                 mix = sources[:, 0]
                 sources = sources[:, 1:]
 
+            # NaN protection on inputs
+            if torch.isnan(mix).any():
+                mix = torch.nan_to_num(mix, nan=0.0)
+            if torch.isnan(sources).any():
+                sources = torch.nan_to_num(sources, nan=0.0)
+
             if not train:
                 estimate = apply_model(self.model, mix, split=True, overlap=0)
             else:
-                with autocast():
-                   estimate = self.model(mix)
+                if self.device.type == 'cuda':
+                    with torch.amp.autocast('cuda'):
+                        estimate = self.model(mix)
+                else:
+                    estimate = self.model(mix)
 
             assert estimate.shape == sources.shape, (estimate.shape, sources.shape)
 
@@ -217,38 +223,63 @@ class Solver(object):
 
             losses = {}
 
+            # NaN loss protection: skip batch if loss is NaN or Inf
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.warning(f"NaN/Inf loss detected at batch {idx}, skipping...")
+                self.optimizer.zero_grad()
+                del loss, estimate
+                continue
+
             losses['loss'] = loss
             if not train:
                 nsdrs = new_sdr(sources, estimate.detach()).mean(0)
-                nsdrs = self.accelerator.reduce(nsdrs, reduction="mean")
-                total = 0
+                total_nsdr = 0
                 for source, nsdr in zip(self.config.model.sources, nsdrs):
                     losses[f'nsdr_{source}'] = nsdr
-                    total += nsdr
-                losses['nsdr'] = total / len(self.config.model.sources)
+                    total_nsdr += nsdr
+                losses['nsdr'] = total_nsdr / len(self.config.model.sources)
 
             # optimize model in training mode
             if train:
-                scaled_loss = self.scaler.scale(loss)
-                self.accelerator.backward(scaled_loss)
-                grad_norm = 0
-                grads = []
-                for p in self.model.parameters():
-                    if p.grad is not None:
-                        grad_norm += p.grad.data.norm()**2
-                        grads.append(p.grad.data)
-                losses['grad'] = grad_norm ** 0.5
-
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
                 self.optimizer.zero_grad()
+                if self.scaler is not None:
+                    self.scaler.scale(loss).backward()
+
+                    # Unscale before clipping
+                    self.scaler.unscale_(self.optimizer)
+
+                    # Gradient clipping to prevent exploding gradients
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.max_grad_norm)
+                    losses['grad'] = grad_norm
+
+                    # Skip step if gradients contain NaN/Inf
+                    valid_gradients = True
+                    for p in self.model.parameters():
+                        if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                            valid_gradients = False
+                            break
+
+                    if valid_gradients:
+                        self.scaler.step(self.optimizer)
+                    else:
+                        logger.warning(f"NaN/Inf gradients at batch {idx}, skipping optimizer step")
+
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.max_grad_norm)
+                    losses['grad'] = grad_norm
+                    self.optimizer.step()
+
                 for ema in self.emas['batch']:
                     ema.update()
-                if self.config.save_every and (idx+1) % self.config.save_every == 0:
-                    self._serialize(epoch, idx+1)
+                if self.config.save_every and (idx + 1) % self.config.save_every == 0:
+                    self._serialize(epoch, idx + 1)
 
             losses = averager(losses)
-            
+
             del loss, estimate
 
         if train:

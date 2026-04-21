@@ -122,7 +122,7 @@ class Seperator:
             self.save_sources(separated_music_arrays, output_sample_rates, save_dir)
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Music Source Separation using SCNet")
+    parser = argparse.ArgumentParser(description="Music Source Separation using Online SCNet")
     parser.add_argument('--input_dir', type=str, help='Input directory containing audio files')
     parser.add_argument('--output_dir', type=str, help='Output directory to save separated sources')
     parser.add_argument('--config_path', type=str, default='./conf/config.yaml', help='Path to configuration file')

@@ -5,6 +5,7 @@ import hashlib
 import math
 import json
 import os
+import random
 from pathlib import Path
 import tqdm
 
@@ -14,9 +15,7 @@ import torchaudio as ta
 from torch.nn import functional as F
 
 from .utils import convert_audio_channels
-from accelerate import Accelerator
-
-accelerator = Accelerator()
+from .log import logger
 
 MIXTURE = "mixture"
 EXT = ".wav"
@@ -82,7 +81,6 @@ def build_metadata(path, sources, normalize=True, ext=EXT):
                 continue
             name = str(root.relative_to(path))
             pendings.append((name, pool.submit(_track_metadata, root, sources, normalize, ext)))
-            # meta[name] = _track_metadata(root, sources, normalize, ext)
         for name, pending in tqdm.tqdm(pendings, ncols=120):
             meta[name] = pending.result()
     return meta
@@ -169,29 +167,44 @@ class Wavset:
 
 
 def get_wav_datasets(args):
-    """Extract the wav datasets from the XP arguments."""
+    """
+    Extract the wav datasets from the XP arguments.
+
+    The dataset has two folders: train/ and test/.
+    Since there is no separate valid/ folder, we split the train/
+    folder 80/20 into training and validation sets.
+    """
     sig = hashlib.sha1(str(args.wav).encode()).hexdigest()[:8]
     metadata_file = Path(args.metadata) / ('wav_' + sig + ".json")
     train_path = Path(args.wav) / "train"
-    valid_path = Path(args.wav) / "valid"
-    if not metadata_file.is_file() and accelerator.is_main_process:
+
+    if not metadata_file.is_file():
         metadata_file.parent.mkdir(exist_ok=True, parents=True)
-        train = build_metadata(train_path, args.sources)
-        valid = build_metadata(valid_path, args.sources)
-        json.dump([train, valid], open(metadata_file, "w"))
-    accelerator.wait_for_everyone()
+        all_train_meta = build_metadata(train_path, args.sources)
 
-    train, valid = json.load(open(metadata_file))
-    kw_cv = {}
+        # Deterministic 80/20 split
+        all_track_names = sorted(all_train_meta.keys())
+        rng = random.Random(42)  # Fixed seed for reproducibility
+        rng.shuffle(all_track_names)
 
-    train_set = Wavset(train_path, train, args.sources,
+        split_idx = int(len(all_track_names) * 0.8)
+        train_names = sorted(all_track_names[:split_idx])
+        valid_names = sorted(all_track_names[split_idx:])
+
+        train_meta = {name: all_train_meta[name] for name in train_names}
+        valid_meta = {name: all_train_meta[name] for name in valid_names}
+
+        logger.info(f"Split: {len(train_names)} train, {len(valid_names)} valid tracks")
+        json.dump([train_meta, valid_meta], open(metadata_file, "w"))
+
+    train_meta, valid_meta = json.load(open(metadata_file))
+
+    train_set = Wavset(train_path, train_meta, args.sources,
                        segment=args.segment, shift=args.shift,
                        samplerate=args.samplerate, channels=args.channels,
                        normalize=args.normalize)
-    valid_set = Wavset(valid_path, valid, [MIXTURE] + list(args.sources),
+    # For validation, load full tracks (no segment) with mixture as first source
+    valid_set = Wavset(train_path, valid_meta, [MIXTURE] + list(args.sources),
                        samplerate=args.samplerate, channels=args.channels,
-                       normalize=args.normalize, **kw_cv)
+                       normalize=args.normalize)
     return train_set, valid_set
-
-
-
